@@ -8,7 +8,7 @@ Deploy Proxmox VMs directly from Herdr. Choose a template, **shepherd** clones a
 
 - macOS or Linux with Herdr running, `hc`, Python 3.9+, and OpenSSH.
 - Proxmox API token and a local SSH key pair.
-- A Debian/Ubuntu-compatible QEMU template with QEMU Guest Agent and reachable networking.
+- A Linux or Windows QEMU template with QEMU Guest Agent and reachable networking.
 
 ## Install
 
@@ -20,6 +20,8 @@ To update: `python3 install.py --update`.
 
 Open **shepherd** beside Files/Changes, add your hypervisor, and select **Deploy VM**. Linked clones are enabled by default.
 
-**shepherd** runs local Python/SSH/`hc` commands and uses the Proxmox API for privileged guest setup. Credentials and job state stay in `~/.config/herdr-app/data/shepherd/` (or your `HERDR_APP_HOME`). SSH uses your configured key files and no guest password or sudo access is created.
+The bootstrap method is selected automatically from the template's OS type in Proxmox. QEMU Guest Agent configures the SSH account, service, and public key on Linux and Windows.
+
+**shepherd** runs local Python/SSH/`hc` commands and uses the Proxmox API for privileged guest setup. Credentials and job state stay in `~/.config/herdr-app/data/shepherd/` (or your `HERDR_APP_HOME`). SSH uses your configured key files. New Windows accounts receive a random guest-local password with key-only SSH. No administrator or sudo privileges are granted.
 
 Implementation and build details: [RECIPE.md](RECIPE.md).

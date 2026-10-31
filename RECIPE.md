@@ -1,8 +1,8 @@
-# Shepherd
+# shepherd
 
 A native Herdr side panel that turns a Proxmox VM template into a connected Herdr machine. A server-icon Shepherd tab sits beside Files and Changes. Select a hypervisor, choose a compatible template, name the machine, and watch a compact deployment row progress to Ready; open its remote workspace with Play.
 
-![Shepherd](preview.png)
+![shepherd](preview.png)
 
 ## What you see
 
@@ -32,7 +32,7 @@ Distribute one folder containing `mods/shepherd/`, `mods/shepherd-tabs/`, `keys.
 
 ### Native UI and integration
 
-`mods/shepherd/` contains `main.js`, `bridge.py`, `mod.json`, `config.example.json`, and `server.svg`, `play.svg`, `retry.svg`, `delete.svg`. Draw simple outline SVGs: two server racks with indicators, a play triangle, a circular retry arrow, and a trash can. No external artwork is needed. Its manifest is `{"place":"none","size":390,"overlay":{"width":520,"height":740}}`.
+`mods/shepherd/` contains `main.js`, `bridge.py`, `windows-bootstrap.ps1`, `windows-install-core.ps1`, `mod.json`, `config.example.json`, and `server.svg`, `play.svg`, `retry.svg`, `delete.svg`. The installer must copy both PowerShell scripts too. Draw simple outline SVGs: two server racks with indicators, a play triangle, a circular retry arrow, and a trash can. No external artwork is needed. Its manifest is `{"place":"none","size":390,"overlay":{"width":520,"height":740}}`.
 
 Default-export a `View` using `div`/`svg` from `gpui-kit` and `h_flex`, `v_flex`, `Input`, `InputState` from `gpui-base`. Create input states in `init`; use callback-local contexts, `cx.spawn` for asynchronous work, `cx.timer` for data polling, and native `frames` for status animation. Import Herdr's `appHome`, `exec`, `readTextFile`, `writeTextFile`, `theme`, `run`, `machines`, and `nextCommand`. Save configuration with the previously read text as the expected value. Handle `refresh`, `new`, `settings`, and `home` command strings. Play calls `space.new` with the job's name and registered machine.
 
@@ -58,6 +58,18 @@ Probe SSH for up to 180 seconds using BatchMode, IdentitiesOnly, accept-new chec
 
 Resume existing VMs using the captured profile without requiring their original template. Validate VM name, non-template flag, and ownership description. Reconcile recorded tasks and exit status first; infer legacy task types from UPIDs. Delete uses the same serialized worker: verify ownership and absence of a Proxmox lock, stop and await completion, DELETE with `purge=1`, await completion, then remove only the matching Herdr machine registration. Persist `deleted`; a failed delete with an absent VM stays blocked rather than being assumed successful.
 
+### Windows templates
+
+Select the bootstrap method automatically from the template's Proxmox `ostype` during preflight: values starting with `win` or `w2k` select `windows-ssh`. Other templates use Linux `guest-agent` or the profile's existing `cloud-init` mode. Do not infer the OS from a template name or expose a platform selector. Capture the resolved method in `profileSnapshot` before cloning. On resume, resolve it from the existing VM configuration without requiring its original template.
+
+In `windows-ssh` mode, clone/configure/start and discover IPv4 as usual, then execute `windows-bootstrap.ps1` through QGA with `powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand`. Encode the script as UTF-16LE/base64; inject username, public key, and job ID only as base64-encoded JSON data. Validate the username, key, and job ID before constructing it. Allow 900 seconds for the guest process and propagate its output/error when it exits unsuccessfully.
+
+The PowerShell script installs the OpenSSH Server Windows capability if missing; creates the local user with a random cryptographic password generated only inside the guest and adds it to the standard Users group; preserves existing account passwords/privileges and reports disabled accounts. Use SID-based filesystem permissions independent of the Windows language. Store the public key under `ProgramData/shepherd/authorized_keys/<user>` with SYSTEM/Administrators full access and the user read access. Add an idempotent per-user `Match` block before other SSH Match blocks, enforcing that key file and key-only authentication; preserve a one-time original configuration backup and validate a staged configuration with `sshd -t` before replacing it. Generate new default SSH host keys once per job ID (a cloned identity marker from another job must not suppress regeneration). Enable automatic sshd startup, restart it, and add/enable a dedicated inbound TCP 22 firewall rule. A guest-side exclusive file lock prevents concurrent bootstrap runs; reject reparse points on managed paths. Write timestamped phases/errors to `ProgramData/shepherd/bootstrap.log`, never passwords.
+
+Then probe SSH with `cmd.exe /d /c exit 0`. Only on Windows, run `windows-install-core.ps1` as an encoded PowerShell command over that SSH connection, so installation belongs to the guest user rather than SYSTEM. Read and validate the local `hc --version`; pass that release to the official `https://releases.herdr.dev/core/install.ps1` installer through `HC_VERSION`, with the official release origin and `%LOCALAPPDATA%/Programs/herdr-core` destination. The official installer verifies the downloaded release archive checksum. Reuse an already matching binary with ConPTY present, verify the resulting version, and repair the `hc.exe` alias/user PATH as necessary. Allow 600 seconds; a failed installation must block registration.
+
+Register Windows through `hc machine add` without `--install`, including recovery attempts, and verify with `hc exec --on <name> -- cmd.exe /d /c exit 0`. Linux keeps its existing `hc machine add --install` flow and must never invoke the Windows core installer. Never run Unix `true` on Windows. Surface operation failures through the existing blocked-job path, including the last SSH failure. Template OS/Guest Agent/networking problems remain the user's responsibility; do not add template-readiness approval gates. Deletion remains platform-independent.
+
 ## Watch out
 
 - Herdr's initial check does not exercise asynchronous states or layout. Test the real app. Keep contexts callback-local and allocate inputs only during initialization; `nextCommand()` returns strings.
@@ -67,6 +79,7 @@ Resume existing VMs using the captured profile without requiring their original 
 - The latest-50-job window is a real limit, not pagination. There is no history archive or per-hypervisor concurrency. The installer requires the current main layout's block IDs, is not transactional, and keeps only a one-time keys backup.
 - Guest bootstrap trusts template contents; it does not sanitize all accounts, passwords, machine identities, or packages. The SSH identity marker can be inherited by a derived template. Existing guest-controlled SSH paths are not hardened against symlink races; first SSH contact uses trust-on-first-use. Local file permissions do not isolate hostile code running as the same desktop user. Legacy `passwordlessSudo` is ignored and removed when saving host settings; existing guest privileges are not revoked.
 - All authored comments and UI/error strings are English. Remote program/API output and user-provided names may use other languages. Keep credentials and personal deployment history out of the published bundle.
+- Windows requires functioning QGA command execution, Windows PowerShell/LocalAccounts, and a working feature source if OpenSSH is missing. The Proxmox OS type must describe the guest correctly. Do not rename or automatically reboot Windows. New accounts use a guest-local random password and key-only SSH; existing account privileges are preserved. Guest processes may outlive a local worker timeout, so retries must honor the guest lock. Windows end-to-end provisioning is not yet verified; tests cover automatic selection, QGA transport, registration/probes, retries, and error propagation.
 
 ## Done when
 

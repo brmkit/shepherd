@@ -13,6 +13,10 @@ b = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(b)
 
 
+def successful_command(args, **_kwargs):
+    return 'hc 0.1.15' if args == ['hc', '--version'] else ''
+
+
 class FakeAPI:
     def __init__(self, fail_clone=False):
         self.calls = []
@@ -60,7 +64,7 @@ class WorkerTests(unittest.TestCase):
         with patch.object(b, 'preflight', return_value=(api, {'node': 'pve', 'vmid': 100}, 'ssh-ed25519 AAAA')), \
              patch.object(b, 'guest_address', return_value='192.168.1.50'), \
              patch.object(b, 'guest_exec') as guest, \
-             patch.object(b, 'command', return_value='') as command:
+             patch.object(b, 'command', side_effect=successful_command) as command:
             b.deploy(self.root, self.job)
             return guest, command
 
@@ -302,7 +306,7 @@ class WorkerTests(unittest.TestCase):
         with patch.object(b, 'preflight_resume', return_value=(api, cfg, 'ssh-ed25519 AAAA')), \
              patch.object(b, 'guest_address', return_value='192.168.1.50'), \
              patch.object(b, 'guest_exec') as guest, \
-             patch.object(b, 'command', return_value='') as command:
+             patch.object(b, 'command', side_effect=successful_command) as command:
             b.deploy(self.root, self.job)
             return guest, command
 
@@ -663,6 +667,215 @@ class WorkerTests(unittest.TestCase):
         put = next(c for c in api.calls if c[0] == 'PUT')
         self.assertIn('bridge=vmbr0', put[2]['net0'])
         self.assertTrue(any(c[0] == 'POST' and c[1].endswith('/status/start') for c in api.calls))
+
+    def test_windows_deployment_skips_linux_bootstrap_and_checks_remote_core(self):
+        self.host['profiles'][0]['bootstrap'] = 'windows-ssh'
+        b.atomic(self.root / 'config.json', {'hypervisors': [self.host]})
+        api = FakeAPI()
+        guest, command = self.execute(api)
+        saved = b.load(self.root / 'jobs/1-12345678.json')
+        self.assertEqual(saved['state'], 'done')
+        guest.assert_called_once()
+        self.assertTrue(guest.call_args.kwargs['windows'])
+        self.assertEqual(guest.call_args.kwargs['timeout'], 900)
+        self.assertIn('New-LocalUser', guest.call_args.args[2])
+        commands = [c.args[0] for c in command.call_args_list]
+        ssh = next(c for c in commands if c[0] == 'ssh')
+        self.assertEqual(ssh[-1], 'cmd.exe /d /c exit 0')
+        register = next(c for c in commands if c[:3] == ['hc', 'machine', 'add'])
+        self.assertNotIn('--install', register)
+        install = next(c for c in commands if c[0] == 'ssh' and '-EncodedCommand' in c[-1])
+        self.assertLess(commands.index(install), commands.index(register))
+        self.assertEqual(commands[-1], ['hc', 'exec', '--on', 'test-vm', '--', 'cmd.exe', '/d', '/c', 'exit', '0'])
+        settings = next(c[2] for c in api.calls if c[0] == 'PUT')
+        self.assertNotIn('ciuser', settings)
+        self.assertNotIn('sshkeys', settings)
+
+    def windows_api(self):
+        api = FakeAPI()
+        original_get = api.get
+        def get(path):
+            if path == 'cluster/resources?type=vm':
+                return [{'vmid': 100, 'type': 'qemu', 'template': 1, 'name': 'template', 'node': 'pve'}]
+            if path.endswith('/config'):
+                return {'ostype': 'win11', 'net0': 'virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr0',
+                        'name': 'test-vm', 'description': 'job ' + self.job['id']}
+            if path == 'nodes/pve/network':
+                return [{'iface': 'vmbr0', 'active': 1}]
+            return original_get(path)
+        api.get = get
+        return api
+
+    def test_windows_template_automatically_switches_bootstrap_and_saves_mode(self):
+        # Even a Linux cloud-init profile must yield to the actual template OS.
+        self.host['profiles'][0]['bootstrap'] = 'cloud-init'
+        b.atomic(self.root / 'config.json', {'hypervisors': [self.host]})
+        api = self.windows_api()
+        with patch.object(b, 'API', return_value=api), \
+             patch.object(b, 'local_preflight', return_value='ssh-ed25519 AAAA'), \
+             patch.object(b, 'guest_address', return_value='192.0.2.10'), \
+             patch.object(b, 'guest_exec') as guest, patch.object(b, 'command', side_effect=successful_command) as command:
+            b.deploy(self.root, self.job)
+        saved = b.load(self.root / 'jobs/1-12345678.json')
+        self.assertEqual(saved['state'], 'done')
+        self.assertEqual(saved['profileSnapshot']['bootstrap'], 'windows-ssh')
+        guest.assert_called_once()
+        self.assertTrue(guest.call_args.kwargs['windows'])
+        self.assertEqual(command.call_args.args[0][-5:], ['cmd.exe', '/d', '/c', 'exit', '0'])
+        self.assertNotIn('ciuser', next(c[2] for c in api.calls if c[0] == 'PUT'))
+
+    def test_bootstrap_is_selected_from_proxmox_os_type(self):
+        for os_type in ('win11', 'win10', 'w2k22', 'w2k19'):
+            self.assertEqual(b.bootstrap_mode({}, {'ostype': os_type}), 'windows-ssh')
+        self.assertEqual(b.bootstrap_mode({'bootstrap': 'windows-ssh'}, {'ostype': 'l26'}), 'guest-agent')
+        self.assertEqual(b.bootstrap_mode({'bootstrap': 'cloud-init'}, {'ostype': 'l26'}), 'cloud-init')
+        self.assertEqual(b.bootstrap_mode({}, {'ostype': 'l26', 'name': 'windows-named-linux'}), 'guest-agent')
+        self.assertEqual(b.bootstrap_mode({}, {}), 'guest-agent')
+
+    def test_resume_detects_windows_from_existing_vm_without_original_template(self):
+        self.persist(vmid=200, node='pve', profileSnapshot={'bootstrap': 'guest-agent'})
+        self.host['profiles'] = []
+        b.atomic(self.root / 'config.json', {'hypervisors': [self.host]})
+        api = self.windows_api()
+        with patch.object(b, 'API', return_value=api), \
+             patch.object(b, 'local_preflight', return_value='ssh-ed25519 AAAA'), \
+             patch.object(b, 'guest_address', return_value='192.0.2.10'), \
+             patch.object(b, 'guest_exec') as guest, patch.object(b, 'command', side_effect=successful_command) as command:
+            b.deploy(self.root, self.job)
+        saved = b.load(self.root / 'jobs/1-12345678.json')
+        self.assertEqual(saved['state'], 'done')
+        self.assertEqual(saved['profileSnapshot']['bootstrap'], 'windows-ssh')
+        self.assertEqual(command.call_args.args[0][-5:], ['cmd.exe', '/d', '/c', 'exit', '0'])
+        self.assertFalse(any(c[1].endswith('/clone') for c in api.calls))
+        guest.assert_called_once()
+        self.assertTrue(guest.call_args.kwargs['windows'])
+
+    def test_bootstrap_cannot_be_overridden_by_deployment_request(self):
+        with self.assertRaisesRegex(b.Error, 'Unsupported deployment overrides'):
+            b.deployment_profile({}, {'bootstrap': 'windows-ssh'})
+
+    def test_windows_ssh_failure_blocks_without_registration(self):
+        self.host['profiles'][0]['bootstrap'] = 'windows-ssh'
+        b.atomic(self.root / 'config.json', {'hypervisors': [self.host]})
+        api = FakeAPI()
+        # Expire the SSH deadline without waiting; guest IP discovery still runs.
+        with patch.object(b, 'preflight', return_value=(api, {'node': 'pve', 'vmid': 100}, 'ssh-ed25519 AAAA')), \
+             patch.object(b, 'guest_address', return_value='192.0.2.10'), \
+             patch.object(b.time, 'monotonic', side_effect=[0, 1, 0, 181]), \
+             patch.object(b, 'guest_exec') as guest, patch.object(b, 'command') as command:
+            b.deploy(self.root, self.job)
+        saved = b.load(self.root / 'jobs/1-12345678.json')
+        self.assertEqual(saved['state'], 'blocked')
+        self.assertIn('SSH not ready', saved['message'])
+        guest.assert_called_once()
+        command.assert_not_called()
+
+    def test_guest_exec_encodes_powershell_and_retains_linux_transport(self):
+        for windows in (False, True):
+            with self.subTest(windows=windows):
+                api = MagicMock()
+                api.post.return_value = {'pid': 42}
+                api.get.return_value = {'exited': True, 'exitcode': 0, 'out-data': 'completed'}
+                script = "Write-Output 'quoted \"text\" and Unicode: \u03bb'"
+                self.assertEqual(b.guest_exec(api, 'vm', script, windows=windows), 'completed')
+                argv = api.post.call_args.kwargs['command']
+                if windows:
+                    self.assertEqual(argv[0], 'powershell.exe')
+                    self.assertEqual(argv[-2], '-EncodedCommand')
+                    self.assertEqual(b.base64.b64decode(argv[-1]).decode('utf-16le'), script)
+                else:
+                    self.assertEqual(argv, ['/bin/sh', '-c', script])
+
+    def test_guest_exec_failure_includes_phase_output_and_error(self):
+        api = MagicMock()
+        api.post.return_value = {'pid': 42}
+        api.get.return_value = {'exited': True, 'exitcode': 1,
+                                'out-data': 'Installing OpenSSH Server', 'err-data': 'Windows Update unavailable'}
+        with self.assertRaises(b.Error) as error:
+            b.guest_exec(api, 'vm', 'script', windows=True)
+        self.assertIn('Installing OpenSSH Server', str(error.exception))
+        self.assertIn('Windows Update unavailable', str(error.exception))
+
+    def test_windows_bootstrap_failure_never_attempts_ssh_or_registration(self):
+        self.host['profiles'][0]['bootstrap'] = 'windows-ssh'
+        b.atomic(self.root / 'config.json', {'hypervisors': [self.host]})
+        with patch.object(b, 'preflight', return_value=(FakeAPI(), {'node': 'pve', 'vmid': 100}, 'ssh-ed25519 AAAA')), \
+             patch.object(b, 'guest_address', return_value='192.0.2.10'), \
+             patch.object(b, 'guest_exec', side_effect=b.Error('OpenSSH installation failed')), \
+             patch.object(b, 'command') as command:
+            b.deploy(self.root, self.job)
+        saved = b.load(self.root / 'jobs/1-12345678.json')
+        self.assertEqual(saved['state'], 'blocked')
+        self.assertIn('OpenSSH installation failed', saved['message'])
+        command.assert_not_called()
+
+    def test_windows_bootstrap_data_cannot_inject_powershell(self):
+        for user in ('user;whoami', 'user\nadmin', 'a' * 21, 'user.'):
+            with self.assertRaises(b.Error):
+                b.windows_bootstrap_script(user, 'ssh-ed25519 AAAA', self.job['id'])
+        with self.assertRaises(b.Error):
+            b.windows_bootstrap_script('shepherd', 'ssh-ed25519 AAAA\nssh-rsa BBBB', self.job['id'])
+        with self.assertRaises(b.Error):
+            b.windows_bootstrap_script('shepherd', 'ssh-ed25519 AAAA', "bad';whoami")
+        key = "ssh-ed25519 AAAA comment ' $(Invoke-Expression bad)"
+        script = b.windows_bootstrap_script('shepherd', key, self.job['id'])
+        encoded = script.split("FromBase64String('", 1)[1].split("')", 1)[0]
+        payload = json.loads(b.base64.b64decode(encoded))
+        self.assertEqual(payload, {'user': 'shepherd', 'publicKey': key, 'job': self.job['id']})
+        self.assertNotIn('Invoke-Expression', script)
+
+    def test_windows_core_install_runs_as_ssh_user_with_local_release(self):
+        ssh = ['ssh', '-i', '/example/key', 'shepherd@192.0.2.10']
+        with patch.object(b, 'command', side_effect=['hc 0.1.15\n', 'verified']) as command:
+            self.assertEqual(b.install_windows_core(ssh), 'verified')
+        self.assertEqual(command.call_args_list[0].args[0], ['hc', '--version'])
+        remote = command.call_args_list[1]
+        self.assertEqual(remote.args[0][:-1], ssh)
+        self.assertEqual(remote.kwargs['timeout'], 600)
+        encoded = remote.args[0][-1].split('-EncodedCommand ', 1)[1]
+        script = b.base64.b64decode(encoded).decode('utf-16le')
+        self.assertTrue(script.startswith("$version = '0.1.15'\n"))
+        self.assertIn('https://releases.herdr.dev/core/install.ps1', script)
+
+    def test_windows_core_install_rejects_unrecognized_local_version(self):
+        with patch.object(b, 'command', return_value='unexpected version output') as command:
+            with self.assertRaisesRegex(b.Error, 'Cannot determine the local hc release'):
+                b.install_windows_core(['ssh', 'guest'])
+        self.assertEqual(command.call_count, 1)
+
+    def test_windows_core_install_failure_blocks_before_registration(self):
+        self.host['profiles'][0]['bootstrap'] = 'windows-ssh'
+        b.atomic(self.root / 'config.json', {'hypervisors': [self.host]})
+        with patch.object(b, 'install_windows_core', side_effect=b.Error('Windows download failed')):
+            _, command = self.execute(FakeAPI())
+        saved = b.load(self.root / 'jobs/1-12345678.json')
+        self.assertEqual(saved['state'], 'blocked')
+        self.assertIn('Windows download failed', saved['message'])
+        self.assertFalse(any(c.args[0][:3] == ['hc', 'machine', 'add'] for c in command.call_args_list))
+
+    def test_linux_never_uses_windows_core_installer(self):
+        with patch.object(b, 'install_windows_core') as install:
+            _, command = self.execute(FakeAPI())
+        install.assert_not_called()
+        registration = next(c.args[0] for c in command.call_args_list if c.args[0][:3] == ['hc', 'machine', 'add'])
+        self.assertIn('--install', registration)
+
+    def test_windows_registration_recovery_does_not_use_install_flag(self):
+        target = 'ssh -i key shepherd@192.0.2.10'
+        self.persist(vmid=200, node='pve', profileSnapshot={'bootstrap': 'windows-ssh'},
+                     registering=True, viaTarget=target)
+        def commands(args, **kwargs):
+            if args == ['hc', 'machine', 'ls', '--json']:
+                return json.dumps({'machines': []})
+            return successful_command(args, **kwargs)
+        with patch.object(b, 'API', return_value=self.windows_api()), \
+             patch.object(b, 'local_preflight', return_value='ssh-ed25519 AAAA'), \
+             patch.object(b, 'guest_address', return_value='192.0.2.10'), \
+             patch.object(b, 'guest_exec'), patch.object(b, 'command', side_effect=commands) as command:
+            b.deploy(self.root, self.job)
+        self.assertEqual(b.load(self.root / 'jobs/1-12345678.json')['state'], 'done')
+        registration = next(c.args[0] for c in command.call_args_list if c.args[0][:3] == ['hc', 'machine', 'add'])
+        self.assertNotIn('--install', registration)
 
     def test_inventory_does_not_return_unused_vms(self):
         api = MagicMock()

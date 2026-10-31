@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Shepherd's local worker. Python standard library; credentials never leave private state."""
+"""shepherd's local worker. Python standard library; credentials never leave private state."""
 import argparse
+import base64
 import contextlib
 import datetime
 import fcntl
@@ -234,15 +235,34 @@ def guest_address(api, base, expected_mac=None):
     return candidates[0]
 
 
-def guest_exec(api, base, script, timeout=120):
-    result = api.post(base + '/agent/exec', command=['/bin/sh', '-c', script])
+def powershell_args(script):
+    return ['powershell.exe', '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+            '-EncodedCommand', base64.b64encode(script.encode('utf-16le')).decode('ascii')]
+
+
+def install_windows_core(ssh):
+    version_output = command(['hc', '--version']).strip()
+    match = re.fullmatch(r'hc (\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)', version_output)
+    if not match:
+        raise Error('Cannot determine the local hc release for Windows installation.')
+    script = "$version = '%s'\n" % match.group(1)
+    script += Path(__file__).with_name('windows-install-core.ps1').read_text()
+    # Base64 and the fixed PowerShell switches are safe in either Windows SSH shell.
+    # SSH ensures installation runs in the actual guest user's profile, not SYSTEM's.
+    return command(ssh + [' '.join(powershell_args(script))], timeout=600)
+
+
+def guest_exec(api, base, script, timeout=120, windows=False):
+    argv = powershell_args(script) if windows else ['/bin/sh', '-c', script]
+    result = api.post(base + '/agent/exec', command=argv)
     pid = result['pid']
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         result = api.get(base + '/agent/exec-status?pid=' + str(pid))
         if result.get('exited'):
             if result.get('exitcode', -1) != 0:
-                raise Error('Guest bootstrap failed: ' + result.get('err-data', result.get('out-data', str(result))))
+                detail = '\n'.join(str(result.get(k, '')) for k in ('out-data', 'err-data')).strip()
+                raise Error('Guest bootstrap failed: ' + (detail or str(result))[-4000:])
             return result.get('out-data', '')
         time.sleep(2)
     raise Error('Guest bootstrap timed out.')
@@ -315,6 +335,18 @@ def bootstrap_script(user, public_key, name):
     ])
 
 
+def windows_bootstrap_script(user, public_key, job_id):
+    if not re.fullmatch(r'[a-z_][a-z0-9_.-]{0,19}', user) or user.endswith('.'):
+        raise Error('Windows SSH username: 1–20 lowercase letters, digits, underscores, dots or hyphens; start with a letter or underscore and do not end with a dot.')
+    if not re.fullmatch(r'\d+-[0-9a-f]{8}', job_id):
+        raise Error('Invalid Windows bootstrap job ID.')
+    if not re.fullmatch(r'(?:ssh-ed25519|ssh-rsa|ecdsa-sha2-[\w-]+) [A-Za-z0-9+/=]+(?: [^\r\n]*)?', public_key):
+        raise Error('Invalid SSH public key.')
+    payload = base64.b64encode(json.dumps({'user': user, 'publicKey': public_key, 'job': job_id}).encode()).decode('ascii')
+    header = "$config = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('%s')) | ConvertFrom-Json\n" % payload
+    return header + Path(__file__).with_name('windows-bootstrap.ps1').read_text()
+
+
 def local_preflight(host, name):
     if not re.fullmatch(r'[a-z][a-z0-9-]{0,47}', name):
         raise Error('VM name: 1–48 lowercase letters, digits or hyphens, starting with a letter.')
@@ -357,6 +389,25 @@ def check_bridge(api, node, host, profile, cfg, fallback=False):
     raise Error('Network bridge is missing or inactive: ' + network_bridge + '. Set bridge in the deployment profile.')
 
 
+def bootstrap_mode(profile, cfg=None):
+    # Proxmox's OS type determines the platform; template names are not reliable.
+    if cfg is not None and str(cfg.get('ostype', '')).lower().startswith(('win', 'w2k')):
+        return 'windows-ssh'
+    mode = profile.get('bootstrap', 'guest-agent')
+    if cfg is not None and mode == 'windows-ssh':
+        return 'guest-agent'
+    if mode not in ('cloud-init', 'guest-agent', 'windows-ssh'):
+        raise Error('Unknown bootstrap mode.')
+    return mode
+
+
+def ssh_probe(mode):
+    if mode == 'windows-ssh':
+        # Works with both cmd.exe and PowerShell as OpenSSH's default shell.
+        return 'cmd.exe /d /c exit 0'
+    return 'cloud-init status --wait' if mode == 'cloud-init' else 'true'
+
+
 def preflight(host, profile, name, existing_vmid=None):
     pub = local_preflight(host, name)
     api = API(host)
@@ -370,9 +421,8 @@ def preflight(host, profile, name, existing_vmid=None):
         raise Error('Template missing, ambiguous, or not visible to this token: ' + profile['template'])
     template = templates[0]
     cfg = api.get('nodes/%s/qemu/%s/config' % (template['node'], template['vmid']))
-    mode = profile.get('bootstrap', 'guest-agent')
-    if mode not in ('cloud-init', 'guest-agent'):
-        raise Error('Unknown bootstrap mode.')
+    mode = bootstrap_mode(profile, cfg)
+    profile['bootstrap'] = mode
     if mode == 'cloud-init' and not any('cloudinit' in str(v).lower() for k, v in cfg.items() if re.fullmatch(r'(ide|sata|scsi)\d+', k)):
         raise Error('Template needs a cloud-init drive and cloud-init installed.')
     if mode == 'cloud-init' and cfg.get('cicustom'):
@@ -391,9 +441,7 @@ def preflight_resume(host, profile, job):
     cfg = api.get('nodes/%s/qemu/%s/config' % (job['node'], job['vmid']))
     if cfg.get('template') or cfg.get('name') != job['name'] or ('job ' + job['id']) not in cfg.get('description', ''):
         raise Error('Cannot resume: VM ownership could not be verified. Inspect the VM in Proxmox.')
-    mode = profile.get('bootstrap', 'guest-agent')
-    if mode not in ('cloud-init', 'guest-agent'):
-        raise Error('Unknown bootstrap mode.')
+    profile['bootstrap'] = bootstrap_mode(profile, cfg)
     check_bridge(api, job['node'], host, profile, cfg, fallback=True)
     return api, cfg, pub
 
@@ -462,6 +510,7 @@ def deploy(root, job):
                 stage('working', 'Previous %s task completed' % (kind or 'Proxmox'))
             stage('working', 'Checking SSH configuration and VM destination')
             api, _cfg, pub = preflight_resume(host, profile, job)
+            job['profileSnapshot'] = dict(profile)
             if task and kind == 'start':
                 status = api.get('nodes/%s/tasks/%s/status' % (node, urllib.parse.quote(task, safe='')))
                 if status['status'] != 'stopped':
@@ -477,6 +526,7 @@ def deploy(root, job):
         else:
             stage('working', 'Checking template and SSH configuration')
             api, template, pub = preflight(host, profile, job['name'])
+            job['profileSnapshot'] = dict(profile)
             if profile.get('pool'):
                 api.get('pools/' + urllib.parse.quote(profile['pool'], safe=''))
             node = template['node']
@@ -504,7 +554,7 @@ def deploy(root, job):
                 raise Error('Invalid bridge name.')
             net = api.get(base + '/config')['net0']
             settings['net0'] = ','.join(part for part in net.split(',') if not part.startswith('bridge=')) + ',bridge=' + network_bridge
-        mode = profile.get('bootstrap', 'guest-agent')
+        mode = bootstrap_mode(profile)
         if mode == 'cloud-init':
             settings.update(ciuser=host.get('sshUser', 'shepherd'), sshkeys=urllib.parse.quote(pub, safe=''), ipconfig0=profile.get('ipconfig', 'ip=dhcp'))
         api.call('PUT', base + '/config', settings)
@@ -534,6 +584,10 @@ def deploy(root, job):
         if mode == 'guest-agent':
             stage('working', 'Creating SSH access through guest agent', address=address)
             guest_exec(api, base, bootstrap_script(host.get('sshUser', 'shepherd'), pub, job['name']), timeout=300)
+        elif mode == 'windows-ssh':
+            stage('working', 'Preparing Windows SSH through guest agent (up to 15 minutes)', address=address)
+            guest_exec(api, base, windows_bootstrap_script(host.get('sshUser', 'shepherd'), pub, job['id']),
+                       timeout=900, windows=True)
         known_hosts = job_known_hosts(root, job)
         ssh = ssh_args(host, address, root, known_hosts=known_hosts)
         old_target = job.get('viaTarget') or job.get('machineTarget')
@@ -545,16 +599,26 @@ def deploy(root, job):
                 raise Error('Stored SSH target is not a Shepherd SSH command.')
             ssh[-1] = ssh[-1].rsplit('@', 1)[0] + '@' + address
         deadline = time.monotonic() + 180
+        last_error = ''
         while time.monotonic() < deadline:
             try:
-                command(ssh + [('cloud-init status --wait' if mode == 'cloud-init' else 'true')], timeout=35)
+                command(ssh + [ssh_probe(mode)], timeout=35)
                 break
-            except (Error, subprocess.TimeoutExpired):
+            except (Error, subprocess.TimeoutExpired) as exc:
+                last_error = str(exc)
                 time.sleep(3)
         else:
-            raise Error('SSH not ready at ' + address + '; verify routing and guest SSH service.')
-        stage('working', 'Installing hc and registering machine', address=address)
+            raise Error('SSH not ready at ' + address + '; verify routing and guest SSH service. ' + last_error[-1600:])
+        if mode == 'windows-ssh':
+            stage('working', 'Installing Windows herdr-core over SSH (up to 10 minutes)', address=address)
+            install_windows_core(ssh)
+        else:
+            stage('working', 'Installing hc and registering machine', address=address)
         target = shlex.join(ssh)
+        register_args = ['hc', 'machine', 'add', '--via', target, '--name', job['name']]
+        if mode != 'windows-ssh':
+            register_args.append('--install')
+        register_args.append('--json')
         if old_target and old_target != target:
             # SSH to the rediscovered guest has succeeded. Retarget only our own registration,
             # retaining both intents across a crash between remove and add.
@@ -582,12 +646,13 @@ def deploy(root, job):
                     command(['hc', 'machine', 'rm', job['name'], '--json'])
                     machine = None
                 if not machine:
-                    command(['hc', 'machine', 'add', '--via', target, '--name', job['name'], '--install', '--json'], timeout=300)
+                    command(register_args, timeout=300)
             else:
-                command(['hc', 'machine', 'add', '--via', target, '--name', job['name'], '--install', '--json'], timeout=300)
+                command(register_args, timeout=300)
             stage('working', 'Machine registered', registered=True, registering=False)
         stage('working', 'Checking remote herdr-core')
-        command(['hc', 'exec', '--on', job['name'], '--', 'true'], timeout=60)
+        probe = ['cmd.exe', '/d', '/c', 'exit', '0'] if mode == 'windows-ssh' else ['true']
+        command(['hc', 'exec', '--on', job['name'], '--'] + probe, timeout=60)
         stage('done', 'Ready in Herdr Machines', machine=job['name'], task=None, taskKind=None, registering=False)
     except StaleAttempt:
         return

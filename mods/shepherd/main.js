@@ -221,7 +221,7 @@ export default class Shepherd extends View {
         .child(div().text_size(12).child('Linked clone'))
         .on_click((_e, c) => { this.editLinkedClone = !this.editLinkedClone; c.notify(); }));
       content.child(div().text_size(11).text_color(t.muted).child('Checked: fast clone sharing the template base disk. Unchecked: independent full clone. Linked clones use template storage.'));
-      content.child(div().text_size(11).text_color(t.muted).child('SSH key login; no account password is generated. Use the VM local administrator for privileged operations.'));
+      content.child(div().text_size(11).text_color(t.muted).child('SSH key login. New Windows accounts get a random password kept only in the guest; SSH is key-only. Use the VM local administrator for privileged operations.'));
       content.child(div().text_size(11).text_color(t.muted).child('Saved locally in data/shepherd/config.json. Profiles inherit guest networking; advanced settings live in that file.'));
       content.child(h_flex().gap(8)
         .child(this.button('save', this.saving ? 'Saving…' : 'Save hypervisor', c => this.saveSettings(c), true, !this.saving))

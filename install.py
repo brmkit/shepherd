@@ -24,7 +24,7 @@ for name in ('shepherd', 'shepherd-tabs'):
     dest = home / 'mods' / name
     dest.mkdir(parents=True, exist_ok=True)
     for path in (source / 'mods' / name).iterdir():
-        if path.is_file() and path.suffix in ('.js', '.json', '.py', '.svg') and path.name != 'jsconfig.json':
+        if path.is_file() and path.suffix in ('.js', '.json', '.py', '.ps1', '.svg') and path.name != 'jsconfig.json':
             shutil.copy2(path, dest / path.name)
 subprocess.run(['python3', str(target / 'bridge.py'), '--root', str(home / 'data/shepherd'), 'init'], check=True)
 keys_path = home / 'keys.json'

@@ -11,7 +11,8 @@
     "sshKey": "~/.ssh/id_ed25519",
     "profiles": [
       { "id": "ubuntu", "name": "Ubuntu 24.04", "template": "ubuntu-24.04-x64-server-template", "cores": 2, "memory": 2048 },
-      { "id": "debian", "name": "Debian 12", "template": "debian-12-x64-server-template", "cores": 2, "memory": 2048 }
+      { "id": "debian", "name": "Debian 12", "template": "debian-12-x64-server-template", "cores": 2, "memory": 2048 },
+      { "id": "windows", "name": "Windows 11", "template": "windows-11-template" }
     ]
   }]
 }

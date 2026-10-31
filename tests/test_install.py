@@ -39,6 +39,8 @@ class InstallerTests(unittest.TestCase):
             self.assertEqual(body['active'], 'shepherd')
             self.assertEqual([child['id'] for child in body['children']], ['files', 'changes', 'shepherd'])
             self.assertTrue(any('layout.switch' in call.args[0] for call in run.call_args_list))
+            self.assertEqual((home / 'mods/shepherd/windows-bootstrap.ps1').read_bytes(),
+                             (INSTALLER.parent / 'mods/shepherd/windows-bootstrap.ps1').read_bytes())
 
     def test_update_preserves_panel_preferences_keys_and_current_layout(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -64,6 +66,8 @@ class InstallerTests(unittest.TestCase):
             self.assertFalse(any('layout.switch' in cmd for cmd in commands))
             self.assertFalse(any('layout.clone' in cmd for cmd in commands))
             self.assertTrue((home / 'mods/shepherd/bridge.py').exists())
+            self.assertTrue((home / 'mods/shepherd/windows-bootstrap.ps1').exists())
+            self.assertTrue((home / 'mods/shepherd/windows-install-core.ps1').exists())
             self.assertTrue((home / 'mods/shepherd/server.svg').exists())
             self.assertFalse((home / 'mods/shepherd/gpui-kit.d.ts').exists())
             self.assertFalse((home / 'mods/shepherd/jsconfig.json').exists())

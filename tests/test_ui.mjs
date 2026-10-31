@@ -76,3 +76,28 @@ await Promise.all(pending);
 assert.notEqual(view.selected, 'pve');
 assert.equal(view.deletePending, null, 'Saving another host must clear pending approval');
 console.log('UI regression checks passed: delete approval, cancel, confirmed action, retry approval, stale-host rejection, add-host reset.');
+
+// Platform detection belongs to the worker, not the creation form.
+const input = value => ({ value: () => value, set_value(next) { value = next; } });
+Object.assign(view, {
+  page: 'create', selected: 'pve', profile: 'template-win', jobs: [],
+  config: { hypervisors: [{ id: 'pve', name: 'Proxmox', url: 'https://pve' }] },
+  inventory: { nodes: [], profiles: [
+    { id: 'template-win', name: 'Windows', available: true },
+    { id: 'template-linux', name: 'Linux', available: true },
+  ] },
+  vmName: input('win-dev'), vmBridge: input(''), vmPool: input(''),
+});
+elements.clear();
+view.render();
+assert.equal(elements.has('bootstrap-windows'), false);
+assert.equal(elements.has('bootstrap-linux'), false);
+click('profile-template-win');
+calls.length = 0;
+view.call = async (action, value) => { calls.push([action, value]); return { id: 'windows-job', state: 'working' }; };
+view.deploy(cx);
+await Promise.all(pending);
+assert.equal(calls[0][0], 'start');
+assert.equal(calls[0][1].profile, 'template-win');
+assert.equal('bootstrap' in calls[0][1].overrides, false);
+console.log('Windows UI checks passed: ordinary template selection, no manual bootstrap override.');
