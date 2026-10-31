@@ -18,6 +18,8 @@ python3 install.py
 
 To update: `python3 install.py --update`.
 
+Installation reuses your personal layout and preserves its other panels. From a shipped layout, it creates and selects a personal copy named **Tabs**. If Tabs already exists, select it first or use `--layout Tabs`. A shipped tab bar is cloned only if needed.
+
 Open **shepherd** beside Files/Changes, add your hypervisor, and select **Deploy VM**. Linked clones are enabled by default.
 
 The bootstrap method is selected automatically from the template's OS type in Proxmox. QEMU Guest Agent configures the SSH account, service, and public key on Linux and Windows.

@@ -1,88 +1,119 @@
-"""Installer regression checks against an isolated, synthetic Herdr home."""
-import contextlib
-import io
+"""Exercise additive integration against synthetic personal and shipped layouts."""
 import json
-import os
 from pathlib import Path
-import runpy
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
 
+sys.path.insert(0, str(Path(__file__).parents[1]))
+from integration import prepare, integrate, patch_tabs, find
 
-INSTALLER = Path(__file__).parents[1] / 'install.py'
+
+BAR = '''const enabled = [...(shared("workspace.panels") ?? ["files", "changes"]), "automations"];
+      .when(enabled.includes("changes"), el => el.child(panelButton("changes", "Changes", "mods/changes/changes.svg")))
+      .child(panelButton("automations", "Automations", "mods/automations/automations.svg"))
+'''
 
 
-class InstallerTests(unittest.TestCase):
-    def test_first_install_integrates_and_selects_shepherd(self):
+class IntegrationTests(unittest.TestCase):
+    def fixture(self, home, shipped=False):
+        (home / 'layouts').mkdir()
+        (home / 'mods/tabs').mkdir(parents=True)
+        (home / 'mods/tabs/main.js').write_text(BAR)
+        (home / 'installed.json').write_text(json.dumps({'tabs': {}, 'layout:personal': {}} if shipped else {}))
+        layout = {'id': 'root', 'children': [
+            {'id': 'tabs', 'content': {'mod': 'tabs', 'props': {'custom': True}}},
+            {'id': 'panel', 'hidden': True, 'size': {'px': 512}, 'children': [
+                {'id': 'panel-body', 'type': 'stack', 'active': 'automations', 'children': [
+                    {'id': 'automations', 'content': {'mod': 'automations'}}]}]}]}
+        (home / 'layouts/personal.json').write_text(json.dumps(layout))
+        return layout
+
+    def test_patch_preserves_other_panels_and_is_idempotent(self):
+        result = patch_tabs(BAR)
+        self.assertIn('"automations"]', result)
+        self.assertIn('panelButton("automations"', result)
+        self.assertEqual(result.count('panelButton("shepherd"'), 1)
+        self.assertEqual(patch_tabs(result), result)
+
+    def test_unknown_bar_is_rejected(self):
+        with self.assertRaises(ValueError):
+            patch_tabs('const enabled = [];\nrenderSomethingElse();')
+
+    def test_personal_layout_and_bar_are_reused(self):
+        with tempfile.TemporaryDirectory() as folder, patch('integration.run') as run:
+            home = Path(folder)
+            before = self.fixture(home)
+            integrate(home, prepare(home, 'personal'))
+            after = json.loads((home / 'layouts/personal.json').read_text())
+            self.assertEqual(find(after, 'tabs'), find(before, 'tabs'))
+            self.assertEqual(find(after, 'panel')['size'], {'px': 512})
+            self.assertTrue(find(after, 'panel')['hidden'])
+            self.assertEqual(find(after, 'panel-body')['active'], 'automations')
+            self.assertIsNotNone(find(after, 'automations'))
+            self.assertIsNotNone(find(after, 'shepherd'))
+            self.assertFalse(any(c.args[0][0] == 'do' for c in run.call_args_list))
+            backups = list(home.rglob('*.before-shepherd-*'))
+            self.assertEqual(len(backups), 2)
+            integrate(home, prepare(home, 'personal'))
+            self.assertEqual(len(list(home.rglob('*.before-shepherd-*'))), 2)
+
+    def test_shipped_bar_is_cloned_in_existing_personal_layout(self):
         with tempfile.TemporaryDirectory() as folder:
             home = Path(folder)
-            (home / 'layouts').mkdir()
-            main = {'id': 'root', 'children': [
-                {'id': 'tabs', 'content': {'mod': 'tabs'}},
-                {'id': 'panel', 'hidden': True, 'size': {'px': 368}, 'children': [
-                    {'id': 'panel-body', 'active': 'files', 'children': [
-                        {'id': 'files'}, {'id': 'changes'}]}]}]}
-            def execute(command, **_kwargs):
-                if 'layout.clone' in command:
-                    (home / 'layouts/shepherd.json').write_text(json.dumps(main))
-            with patch.dict(os.environ, {'HERDR_APP_HOME': folder}), \
-                 patch('sys.argv', ['install.py']), patch('subprocess.run', side_effect=execute) as run, \
-                 contextlib.redirect_stdout(io.StringIO()):
-                runpy.run_path(str(INSTALLER), run_name='__main__')
-            layout = json.loads((home / 'layouts/shepherd.json').read_text())
-            tabs, panel = layout['children']
-            self.assertEqual(tabs['content']['mod'], 'shepherd-tabs')
-            self.assertFalse(panel['hidden'])
-            self.assertEqual(panel['size']['px'], 390)
-            body = panel['children'][0]
-            self.assertEqual(body['active'], 'shepherd')
-            self.assertEqual([child['id'] for child in body['children']], ['files', 'changes', 'shepherd'])
-            self.assertTrue(any('layout.switch' in call.args[0] for call in run.call_args_list))
-            self.assertEqual((home / 'mods/shepherd/windows-bootstrap.ps1').read_bytes(),
-                             (INSTALLER.parent / 'mods/shepherd/windows-bootstrap.ps1').read_bytes())
+            self.fixture(home)
+            (home / 'installed.json').write_text(json.dumps({'tabs': {}}))
+            def command(args, **kwargs):
+                self.assertNotEqual(args[:2], ['do', 'layout.clone'])
+                if args[:2] == ['do', 'mod.clone']:
+                    payload = json.loads(args[2])
+                    dest = home / 'mods' / payload['as']
+                    dest.mkdir()
+                    (dest / 'main.js').write_text(BAR)
+            with patch('integration.run', side_effect=command):
+                integrate(home, prepare(home, 'personal'))
+            self.assertEqual((home / 'mods/tabs/main.js').read_text(), BAR)
+            self.assertFalse((home / 'layouts/personal-plus.json').exists())
+            after = json.loads((home / 'layouts/personal.json').read_text())
+            self.assertEqual(find(after, 'tabs')['content']['mod'], 'tabs-plus')
+            self.assertIn('panelButton("shepherd"', (home / 'mods/tabs-plus/main.js').read_text())
 
-    def test_update_preserves_panel_preferences_keys_and_current_layout(self):
-        with tempfile.TemporaryDirectory() as folder:
+    def test_existing_tabs_layout_is_not_overwritten(self):
+        with tempfile.TemporaryDirectory() as folder, patch('integration.run') as run:
             home = Path(folder)
-            (home / 'layouts').mkdir()
-            layout = {'id': 'root', 'children': [
-                {'id': 'tabs', 'content': {'mod': 'shepherd-tabs'}},
-                {'id': 'panel', 'hidden': True, 'size': {'px': 560}, 'children': [
-                    {'id': 'panel-body', 'active': 'changes', 'children': [
-                        {'id': 'files'}, {'id': 'changes'},
-                        {'id': 'shepherd', 'content': {'mod': 'shepherd'}}]}]}]}
-            path = home / 'layouts/shepherd.json'
-            path.write_text(json.dumps(layout))
-            keys = {'global': {'ctrl-shift-s': 'my-existing-command'}}
-            (home / 'keys.json').write_text(json.dumps(keys))
-            with patch.dict(os.environ, {'HERDR_APP_HOME': folder}), \
-                 patch('sys.argv', ['install.py', '--update']), \
-                 patch('subprocess.run') as run, contextlib.redirect_stdout(io.StringIO()):
-                runpy.run_path(str(INSTALLER), run_name='__main__')
-            self.assertEqual(json.loads(path.read_text()), layout)
-            self.assertEqual(json.loads((home / 'keys.json').read_text())['global']['ctrl-shift-s'], 'my-existing-command')
-            commands = [call.args[0] for call in run.call_args_list]
-            self.assertFalse(any('layout.switch' in cmd for cmd in commands))
-            self.assertFalse(any('layout.clone' in cmd for cmd in commands))
-            self.assertTrue((home / 'mods/shepherd/bridge.py').exists())
-            self.assertTrue((home / 'mods/shepherd/windows-bootstrap.ps1').exists())
-            self.assertTrue((home / 'mods/shepherd/windows-install-core.ps1').exists())
-            self.assertTrue((home / 'mods/shepherd/server.svg').exists())
-            self.assertFalse((home / 'mods/shepherd/gpui-kit.d.ts').exists())
-            self.assertFalse((home / 'mods/shepherd/jsconfig.json').exists())
-
-    def test_existing_layout_conflict_is_rejected_before_copying(self):
-        with tempfile.TemporaryDirectory() as folder:
-            home = Path(folder)
-            (home / 'layouts').mkdir()
-            (home / 'layouts/shepherd.json').write_text('{}')
-            with patch.dict(os.environ, {'HERDR_APP_HOME': folder}), \
-                 patch('sys.argv', ['install.py']), patch('subprocess.run') as run, \
-                 contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-                runpy.run_path(str(INSTALLER), run_name='__main__')
+            before = self.fixture(home, shipped=True)
+            (home / 'layouts/Tabs.json').write_text('{"id":"personal"}')
+            with self.assertRaisesRegex(ValueError, 'Tabs already exists'):
+                prepare(home, 'personal')
             run.assert_not_called()
-            self.assertFalse((home / 'mods').exists())
+            self.assertEqual(json.loads((home / 'layouts/personal.json').read_text()), before)
+            self.assertEqual((home / 'mods/tabs/main.js').read_text(), BAR)
+
+    def test_shipped_layout_is_cloned_as_tabs(self):
+        with tempfile.TemporaryDirectory() as folder:
+            home = Path(folder)
+            before = self.fixture(home)
+            (home / 'installed.json').write_text(json.dumps({'layout:personal': {}}))
+            def command(args, **kwargs):
+                if args[:2] == ['do', 'layout.clone']:
+                    self.assertEqual(json.loads(args[2]), {'name': 'personal', 'as': 'Tabs'})
+                    (home / 'layouts/Tabs.json').write_text(json.dumps(before))
+            with patch('integration.run', side_effect=command):
+                integrate(home, prepare(home, 'personal'))
+            self.assertEqual(json.loads((home / 'layouts/personal.json').read_text()), before)
+            self.assertIsNotNone(find(json.loads((home / 'layouts/Tabs.json').read_text()), 'shepherd'))
+
+    def test_concurrent_edit_is_preserved(self):
+        with tempfile.TemporaryDirectory() as folder, patch('integration.run'):
+            home = Path(folder)
+            self.fixture(home)
+            plan = prepare(home, 'personal')
+            path = home / 'mods/tabs/main.js'
+            path.write_text(BAR + '// Personal edit\n')
+            with self.assertRaises(ValueError):
+                integrate(home, plan)
+            self.assertTrue(path.read_text().endswith('// Personal edit\n'))
 
 
 if __name__ == '__main__':
