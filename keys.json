@@ -1,0 +1,4 @@
+{
+  "global": { "ctrl-shift-s": "mod.open:shepherd" },
+  "mod:shepherd": { "ctrl-r": "shepherd.refresh" }
+}
